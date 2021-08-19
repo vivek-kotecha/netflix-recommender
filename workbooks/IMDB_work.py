@@ -1,6 +1,6 @@
-###################################################################
-"""python module to work with IMDB Data Files """
-###################################################################
+##########################################################################
+"""python module to read and store IMDB Data Files in pandas dataframe """
+#########################################################################
 
 # Import libraries
 import numpy as np
@@ -31,13 +31,19 @@ Returns: a dataframe containing all the records of the IMDB dataset file with ev
 Additional Info: 
 - all the fields are stored as object dtype to avoid any errors 
 - prints the shape and missing value % for the datafile
+
+- "\\N" represents missing or null values in IMDB datasets. These have been replaced with np.nan. 
     """
     
-    df = pd.read_csv(file_directory + file_name, delimiter = "\t", dtype = "object", na_values = "\\N")
+    df = pd.read_csv(file_directory + file_name, 
+                     delimiter = "\t",
+                     dtype = "object", 
+                     na_values = "\\N")
     null_count = pd.Series((df.isnull().sum()/ df.shape[0]).mul(100).round(2))
     null_df = pd.DataFrame({"ColumnName" : null_count.index, "MissingValue%" : null_count.values})
     
     print("The data file {f} contains {r} rows and {c} columns".format(f = file_name, r = df.shape[0], c = df.shape[1]),
           "=".rjust(60, "="), 
-          null_df, sep = "\n")
+          null_df, 
+          sep = "\n")
     return df
