@@ -1,0 +1,567 @@
+setwd("~/MyDatasets")
+
+library(tidyverse)
+library(caret)
+library(stats)
+library(mltools)
+library(Metrics)
+library(data.table)
+library(tools)
+library(stringi)
+library(textclean)
+library(fastDummies)
+library(shiny)
+library(cluster)
+library(bslib)
+
+netflix = read.csv('netflix_title.csv')
+netflix 
+
+# Subset the data to only get the main director 
+
+netflix_director = as.data.frame(str_split(netflix$director, ",", simplify = TRUE)[,1]) 
+colnames(netflix_director) = "lead_director"
+netflix_director = netflix_director %>% mutate(lead_director = ifelse(lead_director == "", "No Director", lead_director))
+
+
+# Subset the data to only get the lead cast member 
+netflix_lead = as.data.frame(str_split(netflix$cast, ",", simplify = TRUE)[,1]) 
+colnames(netflix_lead) = "cast_lead"
+netflix_lead = netflix_lead %>% mutate(cast_lead = ifelse(cast_lead == "", "Unknown Cast", cast_lead))
+
+
+# split up the genres into individual columns
+# Check to see what kind of genres am I dealing with: 
+
+unique_genres = c(unique(str_split(netflix$listed_in, ",", simplify = TRUE)[,1]), unique(str_split(netflix$listed_in, ",", simplify = TRUE)[,2]), unique(str_split(netflix$listed_in, ",", simplify = TRUE)[,3]))
+netflix_english_content = netflix %>% select(title, listed_in) %>% mutate(non_english_content = ifelse(str_detect(listed_in, "(.+/s)?British TV Shows(.+/s)?") == TRUE, FALSE,ifelse(str_detect(listed_in, "(.+/s)?International TV Shows(.+/s)?|(.+/s)?International Movies(.+/s)?|(.+/s)?Anime Series(.+/s)?|(.+/s)?Anime Features(.+/s)?|(.+/s)?Korean TV Shows(.+/s)?|(.+/s)?Spanish-Language TV Shows(.+/s)?") == TRUE, TRUE, FALSE))) 
+
+
+
+# Look at the breakdown of countries 
+
+list_of_countries = unique(c(unique(str_split(netflix$country, ",", simplify = T)[,1]) , unique(str_split(netflix$country, ",", simplify = T)[,2]), unique(str_split(netflix$country, ",", simplify = T)[,3]), unique(str_split(netflix$country, ",", simplify = T)[,4]), unique(str_split(netflix$country, ",", simplify = T)[,5]), unique(str_split(netflix$country, ",", simplify = T)[,6]), unique(str_split(netflix$country, ",", simplify = T)[,7]), unique(str_split(netflix$country, ",", simplify = T)[,8]), unique(str_split(netflix$country, ",", simplify = T)[,9]), unique(str_split(netflix$country, ",", simplify = T)[,10]))) %>% str_squish() %>% unique()
+netflix_english_nation = netflix %>% select(title, country) %>% mutate(in_english_nation = ifelse(str_detect(country, "(.+/s)?United States(.+/s)?|(.+/s)?United Kingdom(.+/s)?|(.+/s)?Canada(.+/s)?|(.+/s)?Australia(.+/s)?|(.+/s)?New Zealand(.+/s)?|(.+/s)?Ireland(.+/s)?|(.+/s)?Jamaica(.+/s)?|(.+/s)?Barbados(.+/s)?") == TRUE, TRUE, FALSE))
+
+
+
+# Figure out which content is English or Not
+# Will be based on Title, Genre, Country 
+# I need to make a function to be able to determine if a character is ASCII or not .... use for Title 
+
+is_not_english = function(string){
+  some_count = 0 # Give a running count for any instance of non-ASCII character 
+  
+  for(char in str_split(string, boundary("character"))[[1]]){
+    if(str_detect(char, "[A-Za-z0-9 \\*\\!\\(\\):,&\\@\\'\\%\\.\\?\\%\\-]") == F){
+      some_count = some_count + 1
+    }
+  }
+  
+  outcome = ifelse(some_count >= 2, "Likely Not English", "Likely English") # characters with at least 2 non-ASCII character = likely not English
+  
+  return(outcome)
+}
+
+
+# Apply this function to tell if a title is a suspected non-English content
+
+netflix_cleaning = cbind(as.data.frame(unlist(map(netflix$title, is_not_english))) %>% rename(is_english = "unlist(map(netflix$title, is_not_english))"), netflix)
+
+
+# Determining if content is really English or Not  
+# If netflix_english_content has non_english_content == TRUE --> For sure not English
+# Looking at country + Title, if netflix_english_nation == TRUE + Netflix_english_content$non_english_content == FALSE + Netflix_cleaning$is_english == "Likely English" --> English
+# netflix_english_nation == FALSE + Netflix_english_content$non_english_content == FALSE + Netflix_cleaning$is_english == "Likely English"/"Not Likely English" --> Not English
+
+
+english_check = cbind(netflix_english_nation %>% select(in_english_nation), netflix_english_content %>% select(non_english_content), netflix_cleaning)
+
+final_english_check = english_check %>% 
+  select(title ,non_english_content, is_english, in_english_nation, cast, director, description) %>% 
+  mutate(
+    assume_english = ifelse(c(non_english_content == T & in_english_nation == T & is_english == "Likely English"), "no",
+                     ifelse(c(non_english_content == T & in_english_nation == F & is_english == "Likely English"), "no",
+                     ifelse(c(non_english_content == T & in_english_nation == T & is_english == "Likely Not English"), "no",
+                     ifelse(c(non_english_content == T & in_english_nation == F & is_english == "Likely Not English"), "no", 
+                     ifelse(c(non_english_content == F & in_english_nation == T & is_english == "Likely English"), "yes",
+                     ifelse(c(non_english_content == F & in_english_nation == F & is_english == "Likely English"), "no",
+                     ifelse(c(non_english_content == F & in_english_nation == T & is_english == "Likely Not English"), "no", "no")))))))
+  )
+
+
+english_check = as.data.frame(final_english_check$assume_english)
+
+netflix_english = cbind(netflix, english_check) 
+
+netflix_english = netflix_english %>% rename(is_english = "final_english_check$assume_english")
+
+
+# Determine if a movie is modern or not; well go with the year 2000 and older = modern movie 
+
+netflix_modern_english = netflix_english %>% mutate(is_modern = ifelse(release_year > 1999, 1, 0))
+
+
+# Combine the individual data frame about lead director, cast lead and whether the content is likely English or not into 1 single data frame
+
+netflix_combine = cbind(as.data.frame(netflix_director$lead_director), as.data.frame(netflix_lead$cast_lead), netflix_modern_english)
+
+netflix_combine = netflix_combine %>% select(-cast, -director, date_added, -release_year, -duration) %>% rename(lead_director = "netflix_director$lead_director", cast_lead = "netflix_lead$cast_lead")
+
+netflix_combine = netflix_combine %>% select(show_id, title, is_modern, type, lead_director, cast_lead, country, is_english, rating, listed_in, description) %>% mutate(type = ifelse(type == "Movie", 1, 0)) %>% rename(is_movie = "type")
+
+
+
+# Split up the listed out genres so that we have individual columns represening out each group
+# NOTE: some things may double up like international content which will refer to anything that isn't American content 
+
+netflix_combine = netflix_combine %>% 
+  mutate(
+    international = ifelse(str_detect(listed_in, "(.+/s)?International TV Shows(.+/s)?|(.+/s)?International Movies(.+/s)?|(.+/s)?British TV Shows(.+/s)?|(.+/s)?Spanish\\-Language TV Shows(.+/s)?|(.+/s)?Korean TV Shows(.+/s)?") == T, 1, 0), 
+    drama = ifelse(str_detect(listed_in, "(.+/s)?Dramas(.+/s)?|(.+/s)?TV Dramas(.+/s)?") == T, 1, 0), 
+    horror = ifelse(str_detect(listed_in, "(.+/s)?Horror Movies(.+/s)?|(.+/s)?TV Horror(.+/s)?") == T, 1, 0), 
+    action_adventure = ifelse(str_detect(listed_in, "(.+/s)?Action \\& Adventure(.+/s)?|(.+/s)?TV Action \\& Adventure(.+/s)?") == T, 1, 0),
+    crime = ifelse(str_detect(listed_in, "(.+/s)?Crime TV Shows(.+/s)?") == T, 1, 0), 
+    docu = ifelse(str_detect(listed_in, "(.+/s)?Documentaries(.+/s)?|(.+/s)?Docuseries(.+/s)?|(.+/s)?Science \\& Nature TV(.+/s)?") == T, 1, 0), 
+    comedy = ifelse(str_detect(listed_in, "(.+/s)?Comedies(.+/s)?|(.+/s)?TV Comedies(.+/s)?|(.+/s)?Stand\\-up Comedy(.+/s)?|(.+/s)?Stand\\-Up Comedy \\& Talk Shows(.+/s)?") == T, 1, 0),
+    anime = ifelse(str_detect(listed_in, "(.+/s)?Anime Features(.+/s)?|(.+/s)?Anime Series(.+/s)?") == T, 1, 0), 
+    independent = ifelse(str_detect(listed_in, "(.+/s)?Independent Movies(.+/s)?") == T, 1, 0), 
+    sports = ifelse(str_detect(listed_in, "(.+/s)?Sport Movies(.+/s)?") == T, 1, 0), 
+    reality = ifelse(str_detect(listed_in, "(.+/s)?Reality TV(.+/s)?") == T, 1, 0), 
+    sci_fi = ifelse(str_detect(listed_in, "(.+/s)?TV Sci\\-Fi \\& Fantasy(.+/s)?|(.+/s)?Sci\\-Fi \\& Fantasy(.+/s)?") == T, 1, 0),
+    family = ifelse(str_detect(listed_in, "(.+/s)?Kid\\'s TV(.+/s)?|(.+/s)?Children \\& Family Movies(.+/s)?|(.+/s)?Teen TV Shows(.+/s)?|(.+/s)?Faith \\& Spirituality(.+/s)?") == T, 1, 0),
+    classic = ifelse(str_detect(listed_in, "(.+/s)?Classic Movies(.+/s)?|(.+/s)?Cult Movies(.+/s)?|(.+/s)?Classic \\& Cult TV(.+/s)?") == T, 1, 0),
+    thriller_mystery = ifelse(str_detect(listed_in, "(.+/s)?Thrillers(.+/s)?|(.+/s)?TV Thrillers(.+/s)?|(.+/s)?TV Mysteries(.+/s)?") == T, 1, 0), 
+    musical = ifelse(str_detect(listed_in, "(.+/s)?Music \\& Musicals(.+/s)?") == T, 1, 0), 
+    romantic = ifelse(str_detect(listed_in, "(.+/s)?Romantic TV Shows(.+/s)?|(.+/s)?Romantic Movies(.+/s)?|(.+/s)?LGBTQ Movies(.+/s)?") == T, 1, 0)
+  ) %>% 
+  select(
+    -listed_in, -country
+  )
+
+# Repeat the process for Content Ratings as well
+
+netflix_combine = netflix_combine %>%
+  mutate(
+    tv_ma = ifelse(rating == "TV-MA", 1, 0),
+    r_rated = ifelse(rating == "R", 1, 0),
+    pg_13 = ifelse(rating == "PG-13", 1, 0),
+    tv_14 = ifelse(rating == "TV-14", 1, 0),
+    tv_pg = ifelse(rating == "TV-PG", 1, 0),
+    not_rated = ifelse(rating == "NR", 1,ifelse(rating == "UR",1, 0)),
+    tv_g = ifelse(rating == "TV-G", 1, 0),
+    tv_y = ifelse(rating == "TV-Y", 1, 0),
+    tv_y7 = ifelse(rating == "TV-Y7", 1, ifelse(rating == "TV-Y7-FV",1, 0)),
+    pg = ifelse(rating == "PG", 1, 0),
+    g_rated = ifelse(rating == "G", 1, 0),
+    nc_17 = ifelse(rating == "NC-17", 1, 0)
+  ) %>%
+  select(
+    -rating
+  )
+
+# TRansform the values here to binary digits for distance metric 
+
+netflix_combine = netflix_combine %>% 
+  mutate(
+    is_english = ifelse(is_english == "no", 0, 1),
+    lead_director = ifelse(is.na(lead_director), "Unknown/No Director", lead_director),
+    cast_lead = ifelse(is.na(cast_lead), "Unknown/No Lead", cast_lead)
+  )
+
+
+# LET'S FIGURE OUT HOW THE END POINT WILL WORK OUT 
+
+# I want to be able to essentially create a means where I take in a show and it gives me an output of some number of movies or shows based on my input
+# From this output, I'll also like to be able to have the ability to titrate it out so that I only get a certain output that'll meet my wants.
+# These will include: Genres (like A multi-select deal?), Movie vs. TV Shows vs. Doesn't Matter, Some number of recommendations 
+
+# FIRST STEP: convert certain variables into the correct data type 
+
+netflix_combine = netflix_combine %>% mutate(cast_lead = as.factor(cast_lead), lead_director = as.factor(lead_director))
+
+# SECOND STEP: dummify the categorical variables 
+
+netflix_combine_for_knn = fastDummies::dummy_cols(netflix_combine, select_columns = c("cast_lead"), remove_selected_columns = TRUE)
+
+# THIRD STEP: Create a dataframe + matrix used for KNN algorithm
+
+
+netflix_for_matrix = netflix_combine_for_knn %>% select(-description, -title, -lead_director, -is_movie)
+rownames(netflix_for_matrix) = netflix_for_matrix[, 1]
+netflix_for_matrix = netflix_for_matrix %>% select(-show_id)
+netflix_matrix = as.matrix(dist(netflix_for_matrix, method = "binary"))
+
+
+# FOURTH STEP: Create a function to be used to generate choices
+
+
+new_recommendation = function(title, data, matrix, k, reference_data){
+  
+  # translate the title to show_id
+  
+  show_id = reference_data$show_id[reference_data$title == title]
+  
+  # create a holder vector to store findings 
+  id = rep(0, nrow(data))
+  metric = rep(0, nrow(data))
+  content_title = reference_data$title
+  description = reference_data$description
+  country = reference_data$country
+  genres = reference_data$listed_in
+  type = reference_data$type
+  
+  for(i in 1:nrow(data)) {
+    if(rownames(data)[i] == show_id) {
+      next
+    } 
+    id[i] = colnames(matrix)[i]
+    metric[i] = matrix[show_id, i]
+  }
+  
+  choices = cbind(as.data.frame(id), as.data.frame(content_title), as.data.frame(description), as.data.frame(metric), as.data.frame(type), as.data.frame(country), as.data.frame(genres))
+  choices = choices %>% arrange(metric) %>% filter(content_title != title)
+  choices = as.data.frame(choices)
+  return(choices[0:(k+1),])
+}  
+
+View(new_recommendation("The Other Guys", netflix_for_matrix, netflix_matrix, 15, netflix))
+
+
+
+new_recommendation("Lucifer", netflix_for_matrix, netflix_matrix, 100, netflix)$content_title
+
+
+
+# LOOK AT USING GOWER'S DISTANCE + CLUSTERING TO FIGURE THIS OUT 
+
+# Say I'm only interested in these variables ... which is fine 
+
+netflix_gower = netflix %>% select(show_id, type, title, director, cast, listed_in, country, rating, description)
+
+# Now I'm only interested in collecting the 
+
+netflix_gower_director = as.data.frame(str_split(netflix_gower$director, ",", simplify = T)[,1]) 
+netflix_gower_director = netflix_gower_director %>% rename(lead_director = 'str_split(netflix_gower$director, ",", simplify = T)[, 1]')
+netflix_gower_director = netflix_gower_director %>% mutate(lead_director = ifelse(lead_director == "", "No Director", lead_director))
+View(netflix_gower_director)
+
+
+netflix_gower_lead = as.data.frame(str_split(netflix_gower$cast, ",", simplify = T)[,1]) 
+netflix_gower_lead = netflix_gower_lead %>% rename(cast_lead = 'str_split(netflix_gower$cast, ",", simplify = T)[, 1]')
+netflix_gower_lead = netflix_gower_lead %>% mutate(cast_lead = ifelse(cast_lead == "", "No Cast", cast_lead))
+View(netflix_gower_lead)
+
+
+# Blow up the Genres 
+
+netflix_gower_genre = netflix_gower %>% 
+  mutate(
+    international = ifelse(str_detect(listed_in, "(.+/s)?International TV Shows(.+/s)?|(.+/s)?International Movies(.+/s)?|(.+/s)?British TV Shows(.+/s)?|(.+/s)?Spanish\\-Language TV Shows(.+/s)?|(.+/s)?Korean TV Shows(.+/s)?") == T, 1, 0), 
+    drama = ifelse(str_detect(listed_in, "(.+/s)?Dramas(.+/s)?|(.+/s)?TV Dramas(.+/s)?") == T, 1, 0), 
+    horror = ifelse(str_detect(listed_in, "(.+/s)?Horror Movies(.+/s)?|(.+/s)?TV Horror(.+/s)?") == T, 1, 0), 
+    action_adventure = ifelse(str_detect(listed_in, "(.+/s)?Action \\& Adventure(.+/s)?|(.+/s)?TV Action \\& Adventure(.+/s)?") == T, 1, 0),
+    crime = ifelse(str_detect(listed_in, "(.+/s)?Crime TV Shows(.+/s)?") == T, 1, 0), 
+    docu = ifelse(str_detect(listed_in, "(.+/s)?Documentaries(.+/s)?|(.+/s)?Docuseries(.+/s)?|(.+/s)?Science \\& Nature TV(.+/s)?") == T, 1, 0), 
+    comedy = ifelse(str_detect(listed_in, "(.+/s)?Comedies(.+/s)?|(.+/s)?TV Comedies(.+/s)?|(.+/s)?Stand\\-up Comedy(.+/s)?|(.+/s)?Stand\\-Up Comedy \\& Talk Shows(.+/s)?") == T, 1, 0),
+    anime = ifelse(str_detect(listed_in, "(.+/s)?Anime Features(.+/s)?|(.+/s)?Anime Series(.+/s)?") == T, 1, 0), 
+    independent = ifelse(str_detect(listed_in, "(.+/s)?Independent Movies(.+/s)?") == T, 1, 0), 
+    sports = ifelse(str_detect(listed_in, "(.+/s)?Sport Movies(.+/s)?") == T, 1, 0), 
+    reality = ifelse(str_detect(listed_in, "(.+/s)?Reality TV(.+/s)?") == T, 1, 0), 
+    sci_fi = ifelse(str_detect(listed_in, "(.+/s)?TV Sci\\-Fi \\& Fantasy(.+/s)?|(.+/s)?Sci\\-Fi \\& Fantasy(.+/s)?") == T, 1, 0),
+    family = ifelse(str_detect(listed_in, "(.+/s)?Kid\\'s TV(.+/s)?|(.+/s)?Children \\& Family Movies(.+/s)?|(.+/s)?Teen TV Shows(.+/s)?|(.+/s)?Faith \\& Spirituality(.+/s)?") == T, 1, 0),
+    classic = ifelse(str_detect(listed_in, "(.+/s)?Classic Movies(.+/s)?|(.+/s)?Cult Movies(.+/s)?|(.+/s)?Classic \\& Cult TV(.+/s)?") == T, 1, 0),
+    thriller_mystery = ifelse(str_detect(listed_in, "(.+/s)?Thrillers(.+/s)?|(.+/s)?TV Thrillers(.+/s)?|(.+/s)?TV Mysteries(.+/s)?") == T, 1, 0), 
+    musical = ifelse(str_detect(listed_in, "(.+/s)?Music \\& Musicals(.+/s)?") == T, 1, 0), 
+    romantic = ifelse(str_detect(listed_in, "(.+/s)?Romantic TV Shows(.+/s)?|(.+/s)?Romantic Movies(.+/s)?|(.+/s)?LGBTQ Movies(.+/s)?") == T, 1, 0)
+  ) %>% select(
+    -listed_in
+  )
+
+
+# Blow up the Rating 
+
+netflix_gower_rating = netflix_gower %>% 
+  mutate(
+    tv_ma = ifelse(rating == "TV-MA", 1, 0),
+    r_rated = ifelse(rating == "R", 1, 0),
+    pg_13 = ifelse(rating == "PG-13", 1, 0),
+    tv_14 = ifelse(rating == "TV-14", 1, 0),
+    tv_pg = ifelse(rating == "TV-PG", 1, 0),
+    not_rated = ifelse(rating == "NR", 1,ifelse(rating == "UR",1, 0)),
+    tv_g = ifelse(rating == "TV-G", 1, 0),
+    tv_y = ifelse(rating == "TV-Y", 1, 0),
+    tv_y7 = ifelse(rating == "TV-Y7", 1, ifelse(rating == "TV-Y7-FV",1, 0)),
+    pg = ifelse(rating == "PG", 1, 0),
+    g_rated = ifelse(rating == "G", 1, 0),
+    nc_17 = ifelse(rating == "NC-17", 1, 0)
+  ) %>%
+  select(
+    -rating
+  )
+
+
+# If content is in an english speaking country or not
+
+netflix_gower_country = as.data.frame(str_split(netflix_gower$country, ",", simplify = T)[,1]) 
+netflix_gower_country = netflix_gower_country %>% rename(country = 'str_split(netflix_gower$country, ",", simplify = T)[, 1]')
+netflix_gower_country = netflix_gower_country %>% mutate(country = ifelse(country == "", "Unlisted Country", country))
+netflix_gower_country = netflix_gower_country %>% 
+  mutate(
+    is_english = ifelse(str_detect(country, "(.+/s)?United States(.+/s)?|(.+/s)?United Kingdom(.+/s)?|(.+/s)?Canada(.+/s)?|(.+/s)?Australia(.+/s)?|(.+/s)?New Zealand(.+/s)?|(.+/s)?Ireland(.+/s)?|(.+/s)?Jamaica(.+/s)?|(.+/s)?Barbados(.+/s)?") == T, 1, 0)
+      )
+
+
+
+# Gotta combine everything into one 
+
+netflix_gower_combine = cbind(netflix %>% select(show_id, type, title, description),
+           netflix_gower_lead %>% mutate(cast_lead = as.factor(cast_lead)), 
+           netflix_gower_country %>% select(is_english),
+           netflix_gower_rating %>% select(tv_ma, r_rated, pg_13, tv_14, tv_pg, not_rated, tv_g, tv_y, tv_y7, pg, g_rated, nc_17),
+           netflix_gower_genre %>% select(international, drama, horror, action_adventure, crime, docu, comedy, anime, independent,sports, reality,sci_fi, family, classic, thriller_mystery, musical, romantic))
+
+
+netflix_gower_combine_1 = netflix_gower_combine %>% select(-show_id, -type, -title, -description)
+netflix_gower_combine_1 = fastDummies::dummy_cols(netflix_gower_combine_1, select_columns = c("cast_lead"), remove_selected_columns = TRUE)
+
+dissimilarity_gower_1 = as.matrix(daisy(netflix_gower_combine_1, metric = "gower"))
+
+row.names(dissimilarity_gower_1) = netflix_gower_combine$show_id 
+colnames(dissimilarity_gower_1) = netflix_gower_combine$show_id 
+
+
+test_selection = netflix_gower_combine %>% filter(title == "Sense8" | title == "Adam Ruins Everything" | title == "The Waterboy")
+test_selection = test_selection %>% mutate(ranking = ifelse(title == "Sense8", 1.1, ifelse(title == "Adam Ruins Everything", 1.05, 1)))
+
+select_data_indices = which(colnames(dissimilarity_gower_1) %in% test_selection$show_id)
+
+test_selection_result_data = data.frame(
+  dissimilarity_gower_1[, select_data_indices], 
+  recommended_netflix_content = row.names(dissimilarity_gower_1) 
+)
+
+
+
+something_here_1 = test_selection_result_data %>% 
+  pivot_longer(
+    cols = c(-"recommended_netflix_content"),
+    names_to = "watched_content", 
+    values_to = "dissimilarity_gower_1"
+  ) %>% 
+  left_join(test_selection, by = c("watched_content" = "show_id")) %>%
+  filter(recommended_netflix_content != watched_content) %>% 
+  mutate(
+    similarity = 1-dissimilarity_gower_1,     
+    weighted_similarity = similarity*ranking
+  ) %>% 
+  group_by(recommended_netflix_content) %>%
+  arrange(desc(weighted_similarity)) %>% 
+  slice(1) %>% 
+  arrange(desc(weighted_similarity))
+
+top_recommendations_1 = something_here_1 %>% head(5)
+
+top_recommendations_1 = top_recommendations_1 %>% 
+  left_join(netflix_gower_combine, by = c("recommended_netflix_content" = "show_id")) %>% 
+  select(recommended_netflix_content, title.y, description.y, weighted_similarity, type.y, cast_lead.y)
+
+top_recommendations_1
+
+recommendations = top_recommendations_1$title.y
+
+
+# SO FUNCTIONALLY THIS WORKS, LET'S JUST MAKE THIS INTO AN ASPECT OF SHINY
+
+#################################################################
+
+
+
+
+
+
+# SIXTH STEP: Create a SHINY APP TO SHOW THIS OFF 
+
+library(bslib)
+
+ui = fluidPage(
+  theme = bs_theme(bootswatch = "simplex"),
+  navbarPage(
+    title = "Tier 3: Recommender Systems Using Netflix Data",
+    inverse = T,
+    navbarMenu(
+      title = "Content-Based Recommender",
+      tabPanel(title = "Using Jaccard's Distance Metric",
+               tags$div(HTML("<body>
+                              <p style = 'font-size: 120%; text-align: justify'>
+                                A way to utilize a KNN-algorithm to determine some movie/TV show recommendation based on what's available on Netflix.  However, in this case
+                                we have treated all relevant variables in our algorithm as a binary and rely on Jaccard's distance metric to determine recommendations. 
+                              </p>
+                             </body>")),
+               tags$br(),
+               sidebarLayout(
+                 sidebarPanel(
+                   textInput(inputId = "title_jaccard", label = "Enter the title of the Netflix content you would like recommendations to be based on."),
+                   textOutput(outputId = "title_check_jaccard"),
+                   tags$br(),
+                   numericInput(inputId = "neighbors_jaccard", label = "Number of recommendations that you would like", min = 1, max = nrow(netflix), value = 1)
+                 ),
+                 mainPanel(
+                   tableOutput(outputId = "jaccard_table")
+                 )
+               ) 
+               ), 
+      tabPanel(title = "Using Gower's Distance Metric",
+               tags$div(HTML("<body>
+                             <p style = 'font-size: 120%; text-align: justify'>
+                              Let's try doing the same thing but with a greater deal with complexity to recommend some movie/TV shows based on three different content on Netflix that have a ranking element included here.  Here
+                              we are utilizing a form of clustering that relies on the use of Gower's distance as opposed to Jaccard's distance metric. 
+                             </p>
+                             </body>")),
+               tags$br(),
+               sidebarLayout(
+                 sidebarPanel(
+                   helpText("In this section, we'll need you to enter the title of 3 TV series and/or Movies on Netflix that you're into in a ranked fashion."),  
+                   tags$br(),
+                   helpText("We'll use this as a benchmark to figure out what sort of other stuff on Netflix to recomment to you.  As a reminder, you'll need to be mindful of spelling and case."),
+                   tags$br(),
+                   textInput(inputId = "gower_entry_1", 
+                             label = "Put down the title for your top-ranked Netflix content here."),
+                   textOutput(outputId = "gower_entry_1_check"),
+                   tags$br(),
+                   textInput(inputId = "gower_entry_2", 
+                             label = "Put down the title for your second-ranked Netflix content here."),
+                   textOutput(outputId = "gower_entry_2_check"),
+                   tags$br(),
+                   textInput(inputId = "gower_entry_3", 
+                             label = "Put down the title for your third-ranked Netflix content here."),
+                   textOutput(outputId = "gower_entry_3_check"),
+                   tags$br(),
+                   numericInput(inputId = "neighbors_gower", label = "Number of recommendations that you would like", min = 1, max = nrow(netflix), value = 1)
+                 ),
+                 mainPanel(
+                   tableOutput(outputId = "Recommendations_Gower")
+                 )
+               )
+               )
+      ),
+    navbarMenu(
+      title = "User-Based Recommender"
+    )
+  )
+  
+)
+
+
+server = function(input, output){
+  
+  # Create a means to check if a text entry is valid or not!
+  
+  output$title_check_jaccard = renderText({
+    if(input$title_jaccard %in% netflix$title){
+      as.character("Valid entry")
+    } else {
+      as.character("Invalid entry. Check your spelling or I don't have this content in this data set.")
+    }
+  })
+  
+  
+  # Need a means for generating a dataframe to display our recommendation choices...ultimately, I need to create a reactive function that changes with the inputs 
+  
+  
+  output$jaccard_table = renderTable({
+    new_recommendation(input$title_jaccard, netflix_for_matrix, netflix_matrix, input$neighbors_jaccard, netflix)
+  })
+  
+  # Create a means to check if the text entry is valid or not
+  
+  output$gower_entry_1_check = renderText({
+    
+    if (input$gower_entry_1 %in% netflix_gower_combine$title) {
+      as.character("Yes this title can be used")
+    } else {
+      as.character("Something went wrong here.  Either there was a mistake in the entry (spelling or case-issue) or this isn't available in what I used in my current Netflix data set.")
+    }
+    
+  })
+  
+  output$gower_entry_2_check = renderText({
+    
+    if (input$gower_entry_2 %in% netflix_gower_combine$title) {
+      as.character("Yes this title can be used")
+    } else {
+      as.character("Something went wrong here.  Either there was a mistake in the entry (spelling or case-issue) or this isn't available in what I used in my current Netflix data set.")
+    }
+    
+  })
+  
+  output$gower_entry_3_check = renderText({
+    
+    if (input$gower_entry_3 %in% netflix_gower_combine$title) {
+      as.character("Yes this title can be used")
+    } else {
+      as.character("Something went wrong here.  Either there was a mistake in the entry (spelling or case-issue) or this isn't available in what I used in my current Netflix data set.")
+    }
+    
+  })
+  
+  # Create a thing that subsets the netflix_recommender_dataset to be used. Plan to use this as the input for the actual recommender system
+  
+  subset_dataset = reactive({
+    netflix_gower_combine %>% 
+      filter(title == input$gower_entry_1 | title == input$gower_entry_2 | title == input$gower_entry_3) %>% 
+      mutate(ranking = ifelse(title == input$gower_entry_1, 1.010, ifelse(title == input$gower_entry_2, 1.005, 1.001)))
+  })
+  
+  
+  
+  # CREATE A MEANS TO PRODUCE RECOMMENDATIONS WITH GOWER DISTANCE 
+  
+  recommending = reactive({
+    
+    number_of_picks = as.numeric(input$neighbors_gower)
+    placeholder_selection_data= subset_dataset()
+    column_1 = netflix_gower_combine$show_id[netflix_gower_combine$title == as.character(input$gower_entry_1)]
+    column_2 = netflix_gower_combine$show_id[netflix_gower_combine$title == as.character(input$gower_entry_2)]
+    column_3 = netflix_gower_combine$show_id[netflix_gower_combine$title == as.character(input$gower_entry_3)]
+    
+    selected_indices = which(colnames(dissimilarity_gower_1) %in% placeholder_selection_data$show_id)
+    getting_dataframe = data.frame(dissimilarity_gower_1[, selected_indices], recommended_netflix_content = row.names(dissimilarity_gower_1))
+    
+    recommendation_data = getting_dataframe %>% 
+      pivot_longer(
+        cols = c(column_1, column_2, column_3), 
+        values_to = "dissimilarity", 
+        names_to = "watched_content"
+      ) %>% 
+      left_join(placeholder_selection_data, by =  c("watched_content" = "show_id")) %>% 
+      filter(recommended_netflix_content != watched_content) %>%
+      mutate(
+        similarity = 1 - dissimilarity, 
+        weighted_similarity = similarity*ranking
+      ) %>% 
+      group_by(recommended_netflix_content) %>% 
+      arrange(desc(weighted_similarity)) %>% 
+      slice(1) %>% 
+      arrange(desc(weighted_similarity))
+    
+    top_recommendations = head(recommendation_data, number_of_picks)
+    
+    top_recommendations = top_recommendations %>% 
+      left_join(netflix_gower_combine, by = c("recommended_netflix_content" = "show_id"))
+    
+    top_recommendations = top_recommendations %>% 
+      left_join(netflix_gower_combine, by = c("recommended_netflix_content" = "show_id")) %>% 
+      select(recommended_netflix_content, title.y, description.y, weighted_similarity, type.y, cast_lead.y)
+    
+    selection = top_recommendations %>% select(title.y, recommended_netflix_content, weighted_similarity, description.y)
+    colnames(selection) = c("Suggested Titles", "Show Id", "Weighted Similarity Score", "Description")
+    selection 
+  })
+  
+  output$Recommendations_Gower = renderTable({recommending()})
+
+}
+
+
+shinyApp(ui, server)
